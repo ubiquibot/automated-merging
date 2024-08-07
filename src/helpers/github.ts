@@ -1,5 +1,5 @@
 import { retryAsync } from "ts-retry";
-import { Context } from "../types";
+import { Context, ReposWatchSettings } from "../types";
 
 export function parseGitHubUrl(url: string) {
   const path = new URL(url).pathname.split("/");
@@ -33,7 +33,7 @@ export async function getMergeTimeoutAndApprovalRequiredCount(context: Context, 
 
 export async function getApprovalCount({ octokit, logger }: Context, { owner, repo, issue_number: pullNumber }: IssueParams) {
   try {
-    const { data: reviews } = await octokit.pulls.listReviews({
+    const { data: reviews } = await octokit.rest.pulls.listReviews({
       owner,
       repo,
       pull_number: pullNumber,
@@ -49,7 +49,7 @@ export async function isCiGreen({ octokit, logger, env }: Context, sha: string, 
   try {
     const ref = sha;
 
-    const { data: checkSuites } = await octokit.checks.listSuitesForRef({
+    const { data: checkSuites } = await octokit.rest.checks.listSuitesForRef({
       owner,
       repo,
       ref,
@@ -58,7 +58,7 @@ export async function isCiGreen({ octokit, logger, env }: Context, sha: string, 
       async () => {
         const checkSuitePromises = checkSuites.check_suites.map(async (suite) => {
           logger.debug(`Checking runs for suite ${suite.id}: ${suite.url}, and filter out ${env.workflowName}`);
-          const { data: checkRuns } = await octokit.checks.listForSuite({
+          const { data: checkRuns } = await octokit.rest.checks.listForSuite({
             owner,
             repo,
             check_suite_id: suite.id,
@@ -74,7 +74,7 @@ export async function isCiGreen({ octokit, logger, env }: Context, sha: string, 
             return null;
           } else if (
             filteredResults.find((o) => {
-              logger.debug(`Workflow ${o.name}/${o.id}[${o.url}]: ${o.status},${o.conclusion}`);
+              logger.debug(`Workflow ${o.name}/${o.id} [${o.url}]: ${o.status},${o.conclusion}`);
               return o.conclusion === "failure";
             })
           ) {
@@ -98,4 +98,67 @@ export async function isCiGreen({ octokit, logger, env }: Context, sha: string, 
     logger.error(`Error checking CI status: ${e}`);
     return false;
   }
+}
+
+function parseTarget({ payload }: Context, target: string) {
+  const owner = payload.repository.owner || "";
+  const [orgParsed, repoParsed] = target.split("/");
+  let repoTarget = null;
+  if (orgParsed !== owner) {
+    return null;
+  } else if (repoParsed) {
+    repoTarget = repoParsed;
+  }
+  return { org: owner, repo: repoTarget };
+}
+
+/**
+ * Returns all the pull requests that are opened and not a draft from the list of repos / organizations.
+ *
+ * https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests#search-only-issues-or-pull-requests
+ */
+export async function getOpenPullRequests(context: Context, targets: ReposWatchSettings) {
+  const { octokit, logger } = context;
+  const filter = [
+    ...targets.monitor.reduce<string[]>((acc, curr) => {
+      const parsedTarget = parseTarget(context, curr);
+      if (parsedTarget) {
+        return [...acc, parsedTarget.repo ? `repo:${parsedTarget.org}/${parsedTarget.repo}` : `org:${parsedTarget.org}`];
+      }
+      return acc;
+    }, []),
+    ...targets.ignore.reduce<string[]>((acc, curr) => {
+      const parsedTarget = parseTarget(context, curr);
+      if (parsedTarget) {
+        return [...acc, parsedTarget.repo ? `-repo:${parsedTarget.org}/${parsedTarget.repo}` : `-org:${parsedTarget.org}`];
+      }
+      return acc;
+    }, []),
+  ];
+  try {
+    const data = await octokit.paginate(octokit.rest.search.issuesAndPullRequests, {
+      q: `is:pr is:open draft:false ${filter.join(" ")}`,
+    });
+    return data.flat();
+  } catch (e) {
+    logger.error(`Error getting open pull-requests for targets: [${filter.join(", ")}]. ${e}`);
+    throw e;
+  }
+}
+
+export async function mergePullRequest(context: Context, { repo, owner, issue_number: pullNumber }: IssueParams) {
+  await context.octokit.pulls.merge({
+    owner,
+    repo,
+    pull_number: pullNumber,
+  });
+}
+
+export async function getPullRequestDetails(context: Context, { repo, owner, issue_number: pullNumber }: IssueParams) {
+  const response = await context.octokit.rest.pulls.get({
+    repo,
+    owner,
+    pull_number: pullNumber,
+  });
+  return response.data;
 }
